@@ -6,12 +6,29 @@ from typing import Any, Callable
 
 from temporalio.client import Client, TLSConfig
 from temporalio.worker import Worker
+from temporalio import activity
 
 from ...exceptions.v1.errors import TemporalError
 from ...models.v1.configs import TemporalConfig, TemporalTLSConfig
 from .tls_utils import resolve_cert_bytes, TLSMaterialError
 
 logger = logging.getLogger(__name__)
+
+# Activity name used by Xians Server / .NET when starting conversational workflows.
+# Workflow history may contain "ScheduleActivity ProcessAndSendMessage"; the Python worker
+# must register an activity under this name to avoid nondeterminism errors on replay.
+SERVER_CONVERSATIONAL_ACTIVITY_ALIAS = "ProcessAndSendMessage"
+
+
+def _make_activity_alias(activity_func: Callable[..., Any], alias_name: str) -> Callable[..., Any]:
+    """Return an activity-decorated callable that delegates to activity_func under alias_name.
+    Temporal requires @activity.defn; use name= so the worker accepts workflow history that
+    schedules the activity by the alias name (e.g. ProcessAndSendMessage).
+    """
+    @activity.defn(name=alias_name)
+    async def _alias(*args: Any, **kwargs: Any) -> Any:
+        return await activity_func(*args, **kwargs)
+    return _alias
 
 
 def build_task_queue_name(
@@ -27,6 +44,22 @@ def build_task_queue_name(
     tenant_part = tenant_id if tenant_id else "default"
 
     return f"xians-{tenant_part}-{scope}-{agent_key}-{workflow_name}"
+
+
+def build_server_task_queue_name(
+    workflow_type: str,
+    tenant_id: str | None = None,
+    system_scoped: bool = False,
+) -> str:
+    """
+    Build task queue name to match Xians Server (parity with .NET).
+    Tenant-scoped: {tenantId}:{workflowType} (e.g. default:My Conversational Agent:Conversational).
+    System-scoped: {workflowType} only.
+    """
+    if system_scoped:
+        return workflow_type
+    tenant_part = tenant_id if tenant_id else "default"
+    return f"{tenant_part}:{workflow_type}"
 
 
 class WorkerHost:
@@ -252,12 +285,18 @@ class WorkerRegistry:
         tenant_id: str | None = None,
         system_scoped: bool = False,
         workers: int = 1,
+        task_queue_override: str | None = None,
+        activity_alias_names: list[str] | None = None,
     ) -> str:
-        task_queue = build_task_queue_name(
-            agent_key=agent_key,
-            workflow_name=workflow_name,
-            tenant_id=tenant_id,
-            system_scoped=system_scoped,
+        task_queue = (
+            task_queue_override
+            if task_queue_override is not None
+            else build_task_queue_name(
+                agent_key=agent_key,
+                workflow_name=workflow_name,
+                tenant_id=tenant_id,
+                system_scoped=system_scoped,
+            )
         )
 
         self._registrations[task_queue] = {
@@ -266,6 +305,7 @@ class WorkerRegistry:
             "workflow_class": workflow_class,
             "activity_func": activity_func,
             "workers": workers,
+            "activity_alias_names": activity_alias_names or [],
         }
 
         logger.debug(f"Registered {workflow_name} for {agent_key} on queue {task_queue}")
@@ -280,7 +320,12 @@ class WorkerRegistry:
 
     def get_activities_for_queue(self, task_queue: str) -> list[Callable]:
         reg = self._registrations.get(task_queue)
-        return [reg["activity_func"]] if reg else []
+        if not reg:
+            return []
+        activities = [reg["activity_func"]]
+        for alias_name in reg.get("activity_alias_names") or []:
+            activities.append(_make_activity_alias(reg["activity_func"], alias_name))
+        return activities
 
     def get_worker_count(self, task_queue: str) -> int:
         reg = self._registrations.get(task_queue)
@@ -291,5 +336,7 @@ __all__ = [
     "WorkerHost",
     "WorkerRegistry",
     "build_task_queue_name",
+    "build_server_task_queue_name",
+    "SERVER_CONVERSATIONAL_ACTIVITY_ALIAS",
 ]
 

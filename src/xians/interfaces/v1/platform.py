@@ -15,8 +15,17 @@ from ...middleware.v1 import (
 from ...models.v1.configs import TemporalConfig, XiansOptions, XiansServerConfig
 from ...models.v1.configs import TemporalTLSConfig
 from ...models.v1.entities import AgentDefinition, WorkflowDefinition
-from ...temporal_workflows.v1.worker_runner import WorkerHost, WorkerRegistry
-from ...temporal_workflows.v1.workflows import ConversationWorkflow, InvokeAgentWorkflow
+from ...temporal_workflows.v1.worker_runner import (
+    WorkerHost,
+    WorkerRegistry,
+    build_server_task_queue_name,
+    SERVER_CONVERSATIONAL_ACTIVITY_ALIAS,
+)
+from ...temporal_workflows.v1.workflows import (
+    ConversationWorkflow,
+    InvokeAgentWorkflow,
+    create_server_conversation_workflow_class,
+)
 from ..v1.agent_client import AgentClient
 from ..v1.xians_client import XiansServerClient
 
@@ -62,13 +71,38 @@ class AgentRegistration:
         self.workflows.append(workflow_def)
 
         if activity_func:
+            agent_key = workflow_def.agent_key
+            tenant_id = self.platform.options.tenant_id
+            task_queue_override = None
+
+            if (
+                self.platform._use_server_task_queue
+                and workflow_type == WorkflowType.CONVERSATIONAL
+            ):
+                workflow_type_str = f"{self.definition.name}:{name}"
+                # So the Temporal worker sandbox can resolve the workflow when it re-imports the module
+                os.environ["XIANS_SERVER_CONVERSATIONAL_WORKFLOW_TYPE"] = workflow_type_str
+                workflow_class = create_server_conversation_workflow_class(workflow_type_str)
+                task_queue_override = build_server_task_queue_name(
+                    workflow_type_str,
+                    tenant_id=tenant_id,
+                    system_scoped=self.definition.system_scoped,
+                )
+
             self.platform._worker_registry.register(
-                agent_key=workflow_def.agent_key,
+                agent_key=agent_key,
                 workflow_name=workflow_def.name,
                 workflow_class=workflow_class,
                 activity_func=activity_func,
+                tenant_id=tenant_id,
                 system_scoped=self.definition.system_scoped,
                 workers=workers,
+                task_queue_override=task_queue_override,
+                activity_alias_names=(
+                    [SERVER_CONVERSATIONAL_ACTIVITY_ALIAS]
+                    if task_queue_override is not None
+                    else None
+                ),
             )
 
         logger.info(f"Defined {workflow_type} workflow '{name}' for agent '{self.definition.name}'")
@@ -165,6 +199,7 @@ class XiansPlatform:
         self.options = options
         self.xians_client = xians_client
         self.temporal_config = temporal_config
+        self._use_server_task_queue = False
 
         self._worker_host: WorkerHost | None = None
         self._worker_registry = WorkerRegistry()
@@ -197,6 +232,7 @@ class XiansPlatform:
         xians_client = XiansServerClient(server_config)
 
         temporal_config = options.temporal
+        fetched_temporal_from_server = temporal_config is None
         if temporal_config is None:
             logger.info("Fetching Temporal settings from Xians Server...")
             try:
@@ -225,8 +261,14 @@ class XiansPlatform:
                     "Failed to fetch Temporal settings from Xians Server",
                     cause=e,
                 )
+        else:
+            logger.warning(
+                "Using a custom Temporal config. For Manager UI and agent registration (Quick Start steps 1-5), "
+                "the worker must use the same cluster as the server—pass temporal=None to use flowserver settings."
+            )
 
         platform = cls(options, xians_client, temporal_config)
+        platform._use_server_task_queue = fetched_temporal_from_server
 
         logger.info("Xians Platform initialized successfully")
         return platform
@@ -302,9 +344,8 @@ class XiansPlatform:
     async def _upload_definitions(self) -> None:
         """Upload agent and workflow definitions to Xians Server."""
         from ...models.v1.server_contracts import (
+            CreateAgentRequest,
             FlowDefinitionRequest,
-            ActivityDefinitionRequest,
-            ParameterDefinition,
         )
 
         logger.info("Uploading definitions to Xians Server...")
@@ -314,30 +355,45 @@ class XiansPlatform:
                 agent_key = agent_reg.definition.agent_key or agent_reg.definition.name
                 agent_reg.definition.agent_key = agent_key
 
+                # Create agent in platform first (POST /api/agent/definitions/agent)
+                try:
+                    await self.xians_client.create_agent(
+                        CreateAgentRequest(
+                            agent_name=agent_key,
+                            system_scoped=agent_reg.definition.system_scoped,
+                            description=getattr(
+                                agent_reg.definition, "description", None
+                            ),
+                            summary=getattr(agent_reg.definition, "summary", None),
+                        )
+                    )
+                    logger.debug(f"Created agent: {agent_key}")
+                except Exception as agent_error:
+                    logger.warning(
+                        f"Create agent for {agent_key} failed (may already exist): {agent_error}"
+                    )
+
                 for workflow_def in agent_reg.workflows:
                     workflow_def.agent_key = agent_key
                     try:
-                        activities = [
-                            ActivityDefinitionRequest(
-                                activity_name=workflow_def.activity_name or "execute_agent_activity",
-                                knowledge_ids=[],
-                            )
-                        ]
-
-                        parameters = [
-                            ParameterDefinition(
-                                name="input",
-                                type="string",
-                            )
-                        ]
-
+                        # Server expects workflowType = "{AgentName}:{FlowName}"
+                        workflow_type_str = f"{agent_key}:{workflow_def.name}"
+                        # Built-in Conversational: empty activity/parameter defs allowed
                         flow_def = FlowDefinitionRequest(
                             agent=agent_key,
-                            workflow_type=workflow_def.workflow_type.value,
+                            workflow_type=workflow_type_str,
                             name=workflow_def.name,
-                            activity_definitions=activities,
-                            parameter_definitions=parameters,
+                            source=getattr(workflow_def, "source", None) or "",
+                            activity_definitions=getattr(
+                                workflow_def, "activity_definitions", None
+                            )
+                            or [],
+                            parameter_definitions=getattr(
+                                workflow_def, "parameter_definitions", None
+                            )
+                            or [],
                             system_scoped=agent_reg.definition.system_scoped,
+                            activable=True,
                         )
 
                         await self.xians_client.upload_flow_definition(flow_def)

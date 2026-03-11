@@ -178,31 +178,27 @@ class TestFlowDefinitionRequest:
             )
         assert "empty" in str(exc_info.value).lower()
 
-    def test_flow_definition_missing_activities_validation(self) -> None:
-        """Test that empty activities list raises validation error."""
+    def test_flow_definition_empty_activities_allowed(self) -> None:
+        """Empty activity_definitions is allowed for built-in Conversational flow."""
         param = ParameterDefinition(name="p1", type="string")
+        req = FlowDefinitionRequest(
+            agent="Agent1",
+            workflow_type="Type1",
+            activity_definitions=[],
+            parameter_definitions=[param],
+        )
+        assert req.activity_definitions == []
 
-        with pytest.raises(ValidationError) as exc_info:
-            FlowDefinitionRequest(
-                agent="Agent1",
-                workflow_type="Type1",
-                activity_definitions=[],
-                parameter_definitions=[param],
-            )
-        assert "at least 1" in str(exc_info.value)
-
-    def test_flow_definition_missing_parameters_validation(self) -> None:
-        """Test that empty parameters list raises validation error."""
+    def test_flow_definition_empty_parameters_allowed(self) -> None:
+        """Empty parameter_definitions is allowed for built-in Conversational flow."""
         activity = ActivityDefinitionRequest(activity_name="a1")
-
-        with pytest.raises(ValidationError) as exc_info:
-            FlowDefinitionRequest(
-                agent="Agent1",
-                workflow_type="Type1",
-                activity_definitions=[activity],
-                parameter_definitions=[],
-            )
-        assert "at least 1" in str(exc_info.value)
+        req = FlowDefinitionRequest(
+            agent="Agent1",
+            workflow_type="Type1",
+            activity_definitions=[activity],
+            parameter_definitions=[],
+        )
+        assert req.parameter_definitions == []
 
 
 class TestChatOrDataRequest:

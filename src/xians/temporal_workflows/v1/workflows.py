@@ -1,8 +1,9 @@
 """Built-in Temporal workflows for Xians SDK v1."""
 
 import logging
+import os
 from datetime import timedelta
-from typing import Any
+from typing import Any, Type
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -76,6 +77,9 @@ class InvokeAgentWorkflow:
 
 @workflow.defn
 class ConversationWorkflow:
+    """Base conversation workflow. Subclasses (e.g. server-aligned) may set _DEFAULT_ACTIVITY_NAME."""
+
+    _DEFAULT_ACTIVITY_NAME = "execute_agent_activity"
 
     def __init__(self) -> None:
         self._messages: list[dict[str, Any]] = []
@@ -97,47 +101,138 @@ class ConversationWorkflow:
     def _create_agent_request(
         self, message: str, metadata: dict[str, Any]
     ) -> AgentRequest:
+        # If workflow was started via SignalWithStart, _session_metadata may not be set yet
+        wf_type = metadata.get("workflowType") or metadata.get("workflow_type") or ""
+        agent_key = self._session_metadata.get("agent_key") or (wf_type.split(":", 1)[0] if ":" in wf_type else wf_type or "unknown")
+        conv_id = (
+            self._session_metadata.get("conversation_id")
+            or metadata.get("threadId")
+            or metadata.get("ThreadId")
+            or metadata.get("thread_id")
+            or "default"
+        )
+        if "agent_key" not in self._session_metadata:
+            self._session_metadata["agent_key"] = agent_key
+        if "conversation_id" not in self._session_metadata:
+            self._session_metadata["conversation_id"] = conv_id
         return AgentRequest(
-            agent_key=self._session_metadata["agent_key"],
-            conversation_id=self._session_metadata["conversation_id"],
+            agent_key=agent_key,
+            conversation_id=conv_id,
             message=message,
             metadata=metadata,
+            timestamp=workflow.now(),
         )
 
     @workflow.run
-    async def run(self, agent_key: str, conversation_id: str) -> dict[str, Any]:
+    async def run(
+        self, agent_key: str = "", conversation_id: str = ""
+    ) -> dict[str, Any]:
+        """Run the workflow. Server may start via SignalWithStart with no input, so args are optional."""
         workflow.logger.info(
-            f"ConversationWorkflow started for agent: {agent_key}, "
-            f"conversation: {conversation_id}"
+            f"ConversationWorkflow started for agent: {agent_key or '(from signal)'}, "
+            f"conversation: {conversation_id or '(from signal)'}"
         )
 
         self._session_metadata = {
-            "agent_key": agent_key,
-            "conversation_id": conversation_id,
+            "agent_key": agent_key or "",
+            "conversation_id": conversation_id or "",
             "started_at": workflow.now().isoformat(),
         }
 
         self._activity_name = workflow.memo_value(
-            "activity_name", default="execute_agent_activity"
+            "activity_name",
+            default=getattr(self.__class__, "_DEFAULT_ACTIVITY_NAME", "execute_agent_activity"),
         )
 
         await workflow.wait_condition(lambda: False)
 
         return {
-            "conversation_id": conversation_id,
+            "conversation_id": self._session_metadata.get("conversation_id", conversation_id or ""),
             "message_count": len(self._messages),
             "metadata": self._session_metadata,
         }
 
     @workflow.signal
     async def inbound_message(self, message: str, metadata: dict[str, Any] | None = None) -> None:
-        workflow.logger.info(f"Received inbound message for conversation workflow")
-
+        workflow.logger.info("Received inbound_message signal for conversation workflow")
         metadata = metadata or {}
         self._record_message(message, metadata, "inbound")
         request = self._create_agent_request(message, metadata)
+        try:
+            response = await workflow.execute_activity(
+                self._activity_name,
+                request,
+                start_to_close_timeout=_DEFAULT_ACTIVITY_TIMEOUT,
+                retry_policy=_DEFAULT_RETRY_POLICY,
+            )
+            self._record_message(
+                response.text or str(response.payload),
+                response.metadata,
+                "outbound",
+            )
+        except Exception as e:
+            workflow.logger.error("Activity failed in inbound_message: %s", e)
+            raise
 
-        workflow.logger.debug(f"Message queued for processing: {message[:50]}...")
+    @workflow.signal
+    async def HandleInboundChatOrData(
+        self, message_or_payload: str | dict[str, Any], metadata: dict[str, Any] | None = None
+    ) -> None:
+        """Handle server Manager UI inbound chat: run activity (activity sends outbound reply).
+        Accepts either (message: str, metadata: dict) or a single payload dict with text/message and participantId etc.
+        Server may send a nested payload (e.g. under "payload" or "Payload"), or a list [message, meta].
+        """
+        workflow.logger.info("Received HandleInboundChatOrData signal")
+        # Some servers send signal as [message, payload_dict]
+        if isinstance(message_or_payload, (list, tuple)) and len(message_or_payload) >= 2:
+            _msg = message_or_payload[0]
+            _meta = (
+                message_or_payload[1]
+                if isinstance(message_or_payload[1], dict)
+                else (metadata or {})
+            )
+            message_or_payload = _msg
+            metadata = _meta
+        if isinstance(message_or_payload, dict):
+            payload = message_or_payload
+            workflow.logger.info(
+                "HandleInboundChatOrData payload (top-level) keys: %s",
+                list(payload.keys()),
+            )
+            # Unwrap nested payload from server (e.g. { "payload": { "threadId": "...", "text": "..." } })
+            if "payload" in payload and isinstance(payload["payload"], dict):
+                payload = payload["payload"]
+                workflow.logger.info("Unwrapped inner payload keys: %s", list(payload.keys()))
+            elif "Payload" in payload and isinstance(payload["Payload"], dict):
+                payload = payload["Payload"]
+                workflow.logger.info("Unwrapped inner Payload keys: %s", list(payload.keys()))
+            message = str(payload.get("text") or payload.get("message") or payload.get("Text") or "")
+            meta = {k: v for k, v in payload.items() if k not in ("text", "message", "Text")}
+        else:
+            message = str(message_or_payload)
+            meta = metadata or {}
+            workflow.logger.info(
+                "HandleInboundChatOrData message (str), metadata keys: %s",
+                list(meta.keys()) if meta else [],
+            )
+        self._record_message(message, meta, "inbound")
+        request = self._create_agent_request(message, meta)
+        try:
+            response = await workflow.execute_activity(
+                self._activity_name,
+                request,
+                start_to_close_timeout=_DEFAULT_ACTIVITY_TIMEOUT,
+                retry_policy=_DEFAULT_RETRY_POLICY,
+            )
+            self._record_message(
+                response.text or str(response.payload),
+                response.metadata,
+                "outbound",
+            )
+        except Exception as e:
+            workflow.logger.error("Activity failed in HandleInboundChatOrData: %s", e)
+            raise
+
 
     @workflow.update
     async def request_response(
@@ -185,5 +280,78 @@ class ConversationWorkflow:
         return self._messages
 
 
-__all__ = ["InvokeAgentWorkflow", "ConversationWorkflow"]
+def create_server_conversation_workflow_class(workflow_type_name: str) -> Type[ConversationWorkflow]:
+    """
+    Create a ConversationWorkflow class registered with the server's workflow type.
+    Use when integrating with Xians Server Manager UI so the server can route signals.
+    workflow_type_name must be {AgentName}:{FlowName} (e.g. 'My Conversational Agent:Conversational').
+    Temporal requires the workflow class to be module-level (no "<locals>" in __qualname__).
+    """
+    # Sanitize for a valid Python identifier
+    safe_suffix = (
+        workflow_type_name.replace(" ", "_")
+        .replace(":", "_")
+        .replace("-", "_")
+        .replace(".", "_")
+    )
+    safe_suffix = "".join(c if (c.isalnum() or c == "_") else "_" for c in safe_suffix)
+    class_name = f"_ServerConversationWorkflow_{safe_suffix}"
+
+    module_globals = globals()
+    if class_name in module_globals:
+        return module_globals[class_name]
+
+    name_repr = repr(workflow_type_name)
+    # Server workflow history may schedule activity "ProcessAndSendMessage"; use that as default
+    # so replay matches and we avoid nondeterminism (worker registers an alias for that name).
+    default_activity_repr = repr("ProcessAndSendMessage")
+    # Define class at module level via exec so __qualname__ does not contain "<locals>"
+    exec(
+        f"""
+@workflow.defn(name={name_repr})
+class {class_name}(ConversationWorkflow):
+    _DEFAULT_ACTIVITY_NAME = {default_activity_repr}
+
+    @workflow.run
+    async def run(self, agent_key: str = "", conversation_id: str = "") -> dict[str, Any]:
+        return await super().run(agent_key, conversation_id)
+
+    @workflow.signal
+    async def inbound_message(self, message: str, metadata: dict[str, Any] | None = None) -> None:
+        await super().inbound_message(message, metadata)
+
+    @workflow.signal
+    async def HandleInboundChatOrData(
+        self, message_or_payload: str | dict[str, Any], metadata: dict[str, Any] | None = None
+    ) -> None:
+        await super().HandleInboundChatOrData(message_or_payload, metadata)
+
+    @workflow.update
+    async def request_response(
+        self, message: str, metadata: dict[str, Any] | None = None
+    ) -> AgentResponse:
+        return await super().request_response(message, metadata)
+
+    @workflow.query
+    def get_session_state(self) -> dict[str, Any]:
+        return super().get_session_state()
+
+    @workflow.query
+    def get_message_history(self) -> list[dict[str, Any]]:
+        return super().get_message_history()
+""",
+        module_globals,
+    )
+    return module_globals[class_name]
+
+
+# When the Temporal worker sandbox re-imports this module, it uses a fresh sys.modules
+# and never ran create_server_conversation_workflow_class. Create the class at import time
+# when the env var is set so the sandbox can resolve the workflow by name.
+_ENV_WORKFLOW_TYPE = os.environ.get("XIANS_SERVER_CONVERSATIONAL_WORKFLOW_TYPE")
+if _ENV_WORKFLOW_TYPE:
+    create_server_conversation_workflow_class(_ENV_WORKFLOW_TYPE)
+
+
+__all__ = ["InvokeAgentWorkflow", "ConversationWorkflow", "create_server_conversation_workflow_class"]
 

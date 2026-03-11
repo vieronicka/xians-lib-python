@@ -14,6 +14,7 @@ from ...models.v1.configs import XiansServerConfig
 from ...models.v1.entities import AgentDefinition, WorkflowDefinition
 from ...models.v1.server_contracts import (
     ChatOrDataRequest,
+    CreateAgentRequest,
     FlowDefinitionRequest,
     HandoffRequest,
     UsageReportRequest,
@@ -142,6 +143,24 @@ class XiansServerClient:
                 f"Unexpected error fetching Temporal settings: {str(e)}",
                 cause=e,
             )
+
+    async def create_agent(self, request: CreateAgentRequest) -> dict[str, Any]:
+        """Create agent in platform (POST /api/agent/definitions/agent). Agent appears in Manager UI."""
+        try:
+            payload = request.model_dump(by_alias=True, exclude_none=True)
+            logger.debug("Creating agent: %s", request.agent_name)
+            response = await self._request(
+                "POST",
+                "/api/agent/definitions/agent",
+                json=payload,
+            )
+            result = response.json()
+            logger.info("Successfully created agent: %s", request.agent_name)
+            return result
+        except XiansServerError as e:
+            if e.status_code == 400:
+                logger.error("Bad Request (400) creating agent. Response: %s", e.response_body)
+            raise
 
     async def upload_flow_definition(
         self,

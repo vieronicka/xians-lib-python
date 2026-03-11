@@ -190,9 +190,9 @@ class AgentRequest(BaseModel):
         default=None,
         description="Idempotency key for request processing",
     )
-    timestamp: datetime = Field(
-        default_factory=lambda: datetime.now().astimezone(),
-        description="Request timestamp",
+    timestamp: datetime | None = Field(
+        default=None,
+        description="Request timestamp (set in workflow with workflow.now() or in activity)",
     )
 
     model_config = {"frozen": False}

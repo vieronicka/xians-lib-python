@@ -122,19 +122,24 @@ class FlowDefinitionRequest(BaseModel):
         serialization_alias="source",
     )
     activity_definitions: list[ActivityDefinitionRequest] = Field(
-        min_length=1,
-        description="Activity definitions (required key, must have >= 1)",
+        default_factory=list,
+        description="Activity definitions (can be empty for built-in Conversational)",
         serialization_alias="activityDefinitions",
     )
     parameter_definitions: list[ParameterDefinition] = Field(
-        min_length=1,
-        description="Top-level parameter definitions (required key, must have >= 1)",
+        default_factory=list,
+        description="Top-level parameter definitions (can be empty)",
         serialization_alias="parameterDefinitions",
     )
     system_scoped: bool = Field(
         default=False,
         description="Whether system-scoped (optional)",
         serialization_alias="systemScoped",
+    )
+    activable: bool = Field(
+        default=True,
+        description="Whether workflow can be started by the server (optional)",
+        serialization_alias="activable",
     )
     onboarding_json: str | None = Field(
         default=None,
@@ -153,6 +158,36 @@ class FlowDefinitionRequest(BaseModel):
             if not v:
                 raise ValueError("Field cannot be empty or whitespace")
         return v
+
+
+class CreateAgentRequest(BaseModel):
+    """
+    Request model for POST /api/agent/definitions/agent (create agent in platform).
+
+    Attributes:
+        agentName: Display name (required); must match name used in workflowType.
+        systemScoped: false = tenant-scoped (Deployed Agents), true = template (system-wide).
+        onboardingJson, description, summary, version, author, category: optional.
+    """
+
+    agent_name: str = Field(
+        min_length=1,
+        description="Agent display name (required)",
+        serialization_alias="agentName",
+    )
+    system_scoped: bool = Field(
+        default=False,
+        description="true = template; false = tenant-scoped",
+        serialization_alias="systemScoped",
+    )
+    onboarding_json: str | None = Field(default=None, serialization_alias="onboardingJson")
+    description: str | None = Field(default=None, serialization_alias="description")
+    summary: str | None = Field(default=None, serialization_alias="summary")
+    version: str | None = Field(default=None, serialization_alias="version")
+    author: str | None = Field(default=None, serialization_alias="author")
+    category: str | None = Field(default=None, serialization_alias="category")
+
+    model_config = {"populate_by_name": True}
 
 
 class ChatOrDataRequest(BaseModel):
@@ -209,6 +244,11 @@ class ChatOrDataRequest(BaseModel):
         default=None,
         description="Request ID for tracking (optional)",
         serialization_alias="requestId",
+    )
+    thread_id: str | None = Field(
+        default=None,
+        description="Thread ID (links reply to same conversation; from signal payload)",
+        serialization_alias="threadId",
     )
     origin: str | None = Field(
         default=None,
@@ -402,6 +442,7 @@ __all__ = [
     "ParameterDefinition",
     "ActivityDefinitionRequest",
     "FlowDefinitionRequest",
+    "CreateAgentRequest",
     "ChatOrDataRequest",
     "HandoffRequest",
     "UsageReportRequest",
